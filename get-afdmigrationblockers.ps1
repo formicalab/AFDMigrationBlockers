@@ -18,7 +18,10 @@ param(
     [string]$FrontDoorName,
 
     [Parameter(Mandatory = $false)]
-    [switch]$ShowDebugInfo
+    [switch]$ShowDebugInfo,
+
+    [Parameter(Mandatory = $false)]
+    [switch]$HideRedirects
 )
 
 Set-StrictMode -Version 1
@@ -209,8 +212,15 @@ Write-Host "`nSummary: $uniqueEndpoints total endpoint(s), $usedEndpoints used b
 Write-Host "         $withCerts endpoint(s) with certificates ($managedCerts Azure-managed, $keyVaultCerts from Key Vault), $withoutCerts without certificates" -ForegroundColor White
 Write-Host "`nShowing ALL frontend endpoints (domains) in this Front Door:`n" -ForegroundColor Gray
 
+# Filter out redirects if HideRedirects flag is set
+$displayInventory = if ($HideRedirects) {
+    $endpointInventory | Where-Object { -not $_.IsRedirect }
+} else {
+    $endpointInventory
+}
+
 # Sort inventory: endpoint name, redirects first, /* patterns first, then by routing rule name
-$sortedInventory = $endpointInventory | Sort-Object EndpointName, `
+$sortedInventory = $displayInventory | Sort-Object EndpointName, `
     @{Expression={-not $_.IsRedirect}; Ascending=$true}, `
     @{Expression={$_.MatchPattern -ne '/*'}; Ascending=$true}, `
     RoutingRule
@@ -248,7 +258,9 @@ Write-Host "  Aff = Session Affinity (*=enabled)" -ForegroundColor Gray
 Write-Host "  Match = Path pattern(s) for the routing rule ('Multiple' if more than one)" -ForegroundColor Gray
 Write-Host "  HTTP/HTTPS = Protocols accepted by the routing rule (*=enabled)" -ForegroundColor Gray
 Write-Host "  Cert = Certificate type: 'Managed' (Azure-managed), 'KeyVault' (from Azure Key Vault), '-' (none)" -ForegroundColor Gray
-Write-Host "  Redirect rules are shown in gray (not migration blockers)" -ForegroundColor Gray
+if (-not $HideRedirects) {
+    Write-Host "  Redirect rules are shown in gray (not migration blockers)" -ForegroundColor Gray
+}
 Write-Host "  Note: If one endpoint is used by multiple routing rules, it will appear multiple times" -ForegroundColor Gray
 
 # Now show migration blockers if any
