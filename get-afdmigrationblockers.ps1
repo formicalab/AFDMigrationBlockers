@@ -3,9 +3,22 @@
 Detects HTTP routes, redirect rules, and other elements in an Azure Front Door (Classic)
 that are incompatible with Azure Front Door Standard/Premium.
 
+.DESCRIPTION
+This script analyzes Azure Front Door Classic configurations and identifies migration blockers
+for Azure Front Door Standard/Premium. It checks for:
+- Frontend endpoints without HTTPS certificates (by testing actual HTTPS connectivity)
+- Custom domains with certificate mismatches or disabled HTTPS
+- Other configuration issues that prevent migration
+
+The script automatically uses system proxy settings when testing HTTPS connectivity.
+
 .REQUIREMENTS
 Install-Module Az.FrontDoor -MinimumVersion 1.13.0
 Connect-AzAccount
+
+.NOTES
+Proxy Support: The script automatically uses system default proxy settings (Internet Options)
+when testing HTTPS connectivity to frontend endpoints.
 #>
 
 #Requires -Version 7.0
@@ -58,22 +71,96 @@ $endpointInventory = New-Object System.Collections.Generic.List[object]
 # Build comprehensive inventory of all frontend endpoints with their routing details
 foreach ($frontend in $fd.FrontendEndpoints) {
     $feName = $frontend.Name
-    $httpsCfg = $frontend.CustomHttpsConfiguration
     $hostName = $frontend.HostName
-    $httpsProvisioningState = $frontend.CustomHttpsProvisioningState
     
-    # Determine certificate status with fallback checks
-    $certificateSource = $httpsCfg.CertificateSource ?? $frontend.CertificateSource ?? 
-        ($frontend.ProtocolType -eq 'ServerNameIndication' ? 'FrontDoor' : 'None')
-    $hasCertificate = $certificateSource -ne 'None'
+    # Test certificate via direct TLS connection
+    $hasCertificate = $false
+    $certError = $null
+    $certExpiration = $null
+    $isMismatch = $false
+    $certDisplayInfo = $null
     
-    # Check session affinity
-    $hasAffinity = $frontend.SessionAffinityEnabledState -eq 'Enabled'
-    
-    # Find all routing rules that use this frontend endpoint
-    $routesUsingEndpoint = $fd.RoutingRules | Where-Object { 
-        $_.FrontendEndpointIds -contains $frontend.Id
+    # Test certificate via TLS connection for all domains
+    $tcpClient = $null
+    $sslStream = $null
+    try {
+        $tcpClient = New-Object System.Net.Sockets.TcpClient
+        $tcpClient.Connect($hostName, 443)
+        
+        $sslStream = New-Object System.Net.Security.SslStream(
+            $tcpClient.GetStream(),
+            $false,
+            { param($s, $cert, $chain, $errors) return $true }
+        )
+        
+        $sslStream.AuthenticateAsClient($hostName)
+        $remoteCert = $sslStream.RemoteCertificate
+        
+        if ($remoteCert) {
+            $x509cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($remoteCert)
+            $certSubject = $x509cert.Subject
+            $certExpiration = $x509cert.NotAfter
+            
+            # Check for certificate issues
+            if ($hostName -notlike '*.azurefd.net' -and 
+                ($certSubject -match 'CN=\*\.azurefd\.net' -or $certSubject -match 'CN=\*\.azureedge\.net')) {
+                # Custom domain using Azure fallback certificate (HTTPS not properly enabled)
+                $hasCertificate = $false
+                $isMismatch = $true
+                $certError = "Azure fallback certificate detected ($certSubject) - HTTPS not enabled for custom domain"
+                # Extract just the CN for display
+                if ($certSubject -match 'CN=([^,]+)') {
+                    $certDisplayInfo = $matches[1]
+                }
+                $certExpiration = $null
+            }
+            elseif ($certExpiration -lt (Get-Date)) {
+                # Certificate has expired
+                $hasCertificate = $false
+                $isMismatch = $true
+                $certError = "Certificate expired on $($certExpiration.ToString('yyyy-MM-dd'))"
+                $certDisplayInfo = "EXPIRED:$($certExpiration.ToString('yyyy-MM-dd'))"
+            }
+            else {
+                $hasCertificate = $true
+            }
+        }
+        else {
+            $hasCertificate = $hostName -like '*.azurefd.net'  # AFD domains always valid
+            if (-not $hasCertificate) {
+                $isMismatch = $true
+                $certError = "TLS connection succeeded but no certificate returned"
+            }
+        }
     }
+    catch [System.Security.Authentication.AuthenticationException] {
+        $hasCertificate = $hostName -like '*.azurefd.net'
+        if (-not $hasCertificate) {
+            $isMismatch = $true
+            $certError = "Authentication failed: $($_.Exception.Message)"
+        }
+    }
+    catch [System.IO.IOException] {
+        $hasCertificate = $hostName -like '*.azurefd.net'
+        if (-not $hasCertificate) {
+            $isMismatch = $true
+            $certError = "TLS connection error: $($_.Exception.Message)"
+        }
+    }
+    catch {
+        $hasCertificate = $hostName -like '*.azurefd.net'
+        if (-not $hasCertificate) {
+            $isMismatch = $true
+            $certError = "Connection error: $($_.Exception.Message)"
+        }
+    }
+    finally {
+        if ($sslStream) { $sslStream.Dispose() }
+        if ($tcpClient) { $tcpClient.Dispose() }
+    }
+    
+    $hasAffinity = $frontend.SessionAffinityEnabledState -eq 'Enabled'
+    $routesUsingEndpoint = $fd.RoutingRules | Where-Object { $_.FrontendEndpointIds -contains $frontend.Id }
     
     if ($ShowDebugInfo) {
         Write-Host "DEBUG: Checking endpoint '$feName' (ID: $($frontend.Id))" -ForegroundColor DarkGray
@@ -81,6 +168,25 @@ foreach ($frontend in $fd.FrontendEndpoints) {
         if ($routesUsingEndpoint) {
             $routesUsingEndpoint | ForEach-Object { Write-Host "DEBUG:   - $($_.Name)" -ForegroundColor DarkGray }
         }
+    }
+    
+    # Check for HTTPS certificate issues and add to issues list
+    if (-not $hasCertificate) {
+        # Build concise error message
+        $detailMsg = $certError ? $certError : "HTTPS certificate problem"
+        
+        if ($routesUsingEndpoint) {
+            $detailMsg += " | Used by routes: $($routesUsingEndpoint.Name -join ', ')"
+        }
+        else {
+            $detailMsg += " | Not used by any routes (consider removing)"
+        }
+        
+        $issues.Add([pscustomobject]@{
+                Type   = 'Frontend endpoint'
+                Name   = $feName
+                Detail = $detailMsg
+            })
     }
     
     if ($routesUsingEndpoint) {
@@ -119,14 +225,14 @@ foreach ($frontend in $fd.FrontendEndpoints) {
                 HTTP = $supportsHttp
                 HTTPS = $supportsHttps
                 CertificateConfigured = $hasCertificate
-                CertificateSource = $certificateSource
-                ProvisioningState = $httpsProvisioningState
+                CertificateExpiration = $certExpiration
+                CertificateDisplayInfo = $certDisplayInfo
+                IsMismatch = $isMismatch
                 IsRedirect = $isRedirect
             })
         }
     }
     else {
-        # Endpoint not used by any routing rule
         $endpointInventory.Add([PSCustomObject]@{
             EndpointName = $feName
             HostName = $hostName
@@ -137,58 +243,11 @@ foreach ($frontend in $fd.FrontendEndpoints) {
             HTTP = $false
             HTTPS = $false
             CertificateConfigured = $hasCertificate
-            CertificateSource = $certificateSource
-            ProvisioningState = $httpsProvisioningState
+            CertificateExpiration = $certExpiration
+            CertificateDisplayInfo = $certDisplayInfo
+            IsMismatch = $isMismatch
             IsRedirect = $false
         })
-    }
-}
-
-# Check for frontend endpoints without HTTPS configuration
-# Front Door Standard/Premium requires HTTPS certificates for all custom domains
-foreach ($frontend in $fd.FrontendEndpoints) {
-    $feName = $frontend.Name
-    $httpsCfg = $frontend.CustomHttpsConfiguration
-    $hostName = $frontend.HostName
-    $httpsProvisioningState = $frontend.CustomHttpsProvisioningState
-    
-    if (-not $hasCertificate) {
-        # Determine the actual issue
-        $detailMsg = "Endpoint '$hostName' - "
-        
-        if ($httpsProvisioningState -eq 'Disabled') {
-            $detailMsg += 'HTTPS is DISABLED for this endpoint (HTTP-only). '
-        }
-        else {
-            $detailMsg += 'No HTTPS certificate configured. '
-        }
-        
-        # Check if any routing rules use this frontend endpoint
-        $allRoutesUsingFrontend = $fd.RoutingRules | Where-Object { 
-            $_.FrontendEndpointIds -contains $frontend.Id
-        }
-        
-        $httpRoutesUsingFrontend = $allRoutesUsingFrontend | Where-Object { 
-            $_.AcceptedProtocols -contains 'Http'
-        }
-        
-        if ($httpRoutesUsingFrontend) {
-            $detailMsg += "CRITICAL BLOCKER: This endpoint is actively used by HTTP routing rule(s): $($httpRoutesUsingFrontend.Name -join ', '). "
-        }
-        elseif ($allRoutesUsingFrontend) {
-            $detailMsg += "USED BY: Routing rule(s): $($allRoutesUsingFrontend.Name -join ', ') (HTTPS-only routes). Standard/Premium still requires HTTPS certificate. "
-        }
-        else {
-            $detailMsg += 'WARNING: This endpoint appears to NOT be used by any routing rules. Consider removing if unused. However, Standard/Premium requires HTTPS on all endpoints. '
-        }
-        
-        $detailMsg += 'REQUIRED ACTION: Enable HTTPS with either Azure-managed certificate or upload custom certificate from Key Vault before migration.'
-        
-        $issues.Add([pscustomobject]@{
-                Type   = 'Frontend endpoint'
-                Name   = $feName
-                Detail = $detailMsg
-            })
     }
 }
 
@@ -205,11 +264,10 @@ $usedEndpoints = ($endpointInventory.Where{$_.RoutingRule -ne '(Not used)'}.Endp
 $unusedEndpoints = $endpointInventory.Where{$_.RoutingRule -eq '(Not used)'}.Count
 $withCerts = ($endpointInventory.Where{$_.CertificateConfigured}.EndpointName | Select-Object -Unique).Count
 $withoutCerts = $uniqueEndpoints - $withCerts
-$managedCerts = ($endpointInventory.Where{$_.CertificateSource -eq 'FrontDoor'}.EndpointName | Select-Object -Unique).Count
-$keyVaultCerts = ($endpointInventory.Where{$_.CertificateSource -eq 'AzureKeyVault'}.EndpointName | Select-Object -Unique).Count
+$withMismatches = ($endpointInventory.Where{$_.IsMismatch}.EndpointName | Select-Object -Unique).Count
 
 Write-Host "`nSummary: $uniqueEndpoints total endpoint(s), $usedEndpoints used by routes, $unusedEndpoints unused" -ForegroundColor White
-Write-Host "         $withCerts endpoint(s) with certificates ($managedCerts Azure-managed, $keyVaultCerts from Key Vault), $withoutCerts without certificates" -ForegroundColor White
+Write-Host "         $withCerts endpoint(s) with valid certificates, $withMismatches with mismatches, $withoutCerts without certificates" -ForegroundColor White
 Write-Host "`nShowing ALL frontend endpoints (domains) in this Front Door:`n" -ForegroundColor Gray
 
 # Filter out redirects if HideRedirects flag is set
@@ -231,9 +289,18 @@ $maxMatch = [Math]::Max(($sortedInventory.MatchPattern | Measure-Object -Maximum
 $maxRule = [Math]::Max(($sortedInventory.RoutingRule | Measure-Object -Maximum -Property Length).Maximum, 'Routing Rule'.Length)
 $maxBackend = [Math]::Max(($sortedInventory.Backend | Measure-Object -Maximum -Property Length).Maximum, 'Backend Pool'.Length)
 
+# Calculate cert column width based on content
+$certLengths = $sortedInventory | ForEach-Object {
+    if ($_.CertificateDisplayInfo) { $_.CertificateDisplayInfo.Length }
+    elseif ($_.CertificateExpiration) { 10 }  # YYYY-MM-DD
+    else { 1 }  # '-'
+}
+$maxCertContent = ($certLengths | Measure-Object -Maximum).Maximum
+$maxCert = [Math]::Max($maxCertContent, 'Cert/Expiry'.Length)
+
 # Print header
-$header = "{0,-$maxEndpoint}  {1,-4}  {2,-5}  {3,-3}  {4,-$maxMatch}  {5,-$maxRule}  {6,-$maxBackend}  {7,-8}" -f `
-    'Endpoint Name', 'HTTP', 'HTTPS', 'Aff', 'Match', 'Routing Rule', 'Backend Pool', 'Cert'
+$header = "{0,-$maxEndpoint}  {1,-4}  {2,-5}  {3,-3}  {4,-$maxMatch}  {5,-$maxRule}  {6,-$maxBackend}  {7,-$maxCert}" -f `
+    'Endpoint Name', 'HTTP', 'HTTPS', 'Aff', 'Match', 'Routing Rule', 'Backend Pool', 'Cert/Expiry'
 Write-Host $header -ForegroundColor White
 Write-Host ("-" * $header.Length) -ForegroundColor White
 
@@ -242,22 +309,42 @@ foreach ($item in $sortedInventory) {
     $aff = $item.SessionAffinity ? '*' : ' '
     $http = $item.HTTP ? '*' : ' '
     $https = $item.HTTPS ? '*' : ' '
-    $cert = $item.CertificateConfigured ? 
-        ($item.CertificateSource -eq 'FrontDoor' ? 'Managed' : 
-         $item.CertificateSource -eq 'AzureKeyVault' ? 'KeyVault' : 'Yes') : '-'
+    $cert = if ($item.CertificateDisplayInfo) {
+        $item.CertificateDisplayInfo
+    }
+    elseif ($item.CertificateExpiration) {
+        $item.CertificateExpiration.ToString('yyyy-MM-dd')
+    }
+    else {
+        '-'
+    }
     
-    $row = "{0,-$maxEndpoint}  {1,-4}  {2,-5}  {3,-3}  {4,-$maxMatch}  {5,-$maxRule}  {6,-$maxBackend}  {7,-8}" -f `
+    $row = "{0,-$maxEndpoint}  {1,-4}  {2,-5}  {3,-3}  {4,-$maxMatch}  {5,-$maxRule}  {6,-$maxBackend}  {7,-$maxCert}" -f `
         $item.EndpointName, $http, $https, $aff, $item.MatchPattern, $item.RoutingRule, $item.Backend, $cert
     
-    # Redirect rules are shown in gray
-    Write-Host $row -ForegroundColor ($item.IsRedirect ? 'DarkGray' : 'White')
+    # Determine row color: Red for problematic domains (mismatch/no certificate), Yellow for expiring soon, DarkGray for redirects, White for normal
+    $rowColor = if ($item.IsMismatch -or -not $item.CertificateConfigured) {
+        'Red'
+    }
+    elseif ($item.CertificateExpiration -and ($item.CertificateExpiration - (Get-Date)).Days -lt 30) {
+        'Yellow'
+    }
+    elseif ($item.IsRedirect) {
+        'DarkGray'
+    }
+    else {
+        'White'
+    }
+    
+    Write-Host $row -ForegroundColor $rowColor
 }
 
 Write-Host "`nLegend:" -ForegroundColor Cyan
 Write-Host "  Aff = Session Affinity (*=enabled)" -ForegroundColor Gray
 Write-Host "  Match = Path pattern(s) for the routing rule ('Multiple' if more than one)" -ForegroundColor Gray
 Write-Host "  HTTP/HTTPS = Protocols accepted by the routing rule (*=enabled)" -ForegroundColor Gray
-Write-Host "  Cert = Certificate type: 'Managed' (Azure-managed), 'KeyVault' (from Azure Key Vault), '-' (none)" -ForegroundColor Gray
+Write-Host "  Cert/Expiry = Certificate info: 'YYYY-MM-DD' (expiration), 'EXPIRED:YYYY-MM-DD' (expired), '*.domain' (fallback cert CN), '-' (none)" -ForegroundColor Gray
+Write-Host "  Certificate problems (expired/fallback) are shown in RED, certificates expiring within 30 days in YELLOW" -ForegroundColor Gray
 if (-not $HideRedirects) {
     Write-Host "  Redirect rules are shown in gray (not migration blockers)" -ForegroundColor Gray
 }
@@ -289,17 +376,5 @@ else {
             Write-Host ('-' * 80) -ForegroundColor DarkGray
         }
     }
-
-    Write-Host "`n`n=== EXPLANATION ===" -ForegroundColor Magenta
-    Write-Host 'Azure Front Door Standard/Premium has different behavior than Classic:' -ForegroundColor White
-    Write-Host ''
-    Write-Host 'FRONTEND ENDPOINTS: In Standard/Premium, all endpoints MUST have HTTPS enabled.' -ForegroundColor Yellow
-    Write-Host '   - Classic allows endpoints without certificates (HTTP-only)' -ForegroundColor Gray
-    Write-Host '   - Standard/Premium requires a certificate for every custom domain' -ForegroundColor Gray
-    Write-Host '   - Solution: Enable Azure-managed certificates or upload custom certificates' -ForegroundColor Green
-    
-    Write-Host "`n`n=== RECOMMENDED ACTIONS ===" -ForegroundColor Magenta
-    Write-Host ' 1. For each frontend endpoint without a certificate: Enable custom HTTPS with Azure-managed or custom certificate'
-    Write-Host ''
 }
 
